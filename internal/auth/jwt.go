@@ -6,8 +6,10 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/golang-jwt/jwt/v5"
 
 	"github.com/modelcontextprotocol/registry/internal/config"
@@ -41,11 +43,22 @@ type TokenResponse struct {
 	ExpiresAt     int    `json:"expires_at"`
 }
 
-// JWTManager handles JWT token operations
+// JWTManager handles JWT token operations and OIDC validation
 type JWTManager struct {
 	privateKey    ed25519.PrivateKey
 	publicKey     ed25519.PublicKey
 	tokenDuration time.Duration
+
+	// OIDC Configurations
+	oidcEnabled      bool
+	oidcIssuer       string
+	oidcClientID     string
+	oidcPublishPerms string
+	oidcEditPerms    string
+
+	// Thread-safe lazy-loading state for OIDC
+	mu           sync.RWMutex
+	oidcVerifier *oidc.IDTokenVerifier
 }
 
 func NewJWTManager(cfg *config.Config) *JWTManager {
@@ -64,13 +77,56 @@ func NewJWTManager(cfg *config.Config) *JWTManager {
 	publicKey := privateKey.Public().(ed25519.PublicKey)
 
 	return &JWTManager{
-		privateKey:    privateKey,
-		publicKey:     publicKey,
-		tokenDuration: 5 * time.Minute, // 5-minute tokens as per requirements
+		privateKey:       privateKey,
+		publicKey:        publicKey,
+		tokenDuration:    5 * time.Minute, // 5-minute tokens as per requirements
+		oidcEnabled:      cfg.OIDCEnabled,
+		oidcIssuer:       cfg.OIDCIssuer,
+		oidcClientID:     cfg.OIDCClientID,
+		oidcPublishPerms: cfg.OIDCPublishPerms,
+		oidcEditPerms:    cfg.OIDCEditPerms,
 	}
 }
 
-// GenerateToken generates a new Registry JWT token
+// getOIDCVerifier returns a thread-safe, lazily initialized IDTokenVerifier
+func (j *JWTManager) getOIDCVerifier(ctx context.Context) (*oidc.IDTokenVerifier, error) {
+	if !j.oidcEnabled {
+		return nil, fmt.Errorf("OIDC is not enabled")
+	}
+
+	// Read lock check
+	j.mu.RLock()
+	verifier := j.oidcVerifier
+	j.mu.RUnlock()
+
+	if verifier != nil {
+		return verifier, nil
+	}
+
+	// Write lock block
+	j.mu.Lock()
+	defer j.mu.Unlock()
+
+	// Double check
+	if j.oidcVerifier != nil {
+		return j.oidcVerifier, nil
+	}
+
+	// Bounded initialization timeout to prevent hanging the HTTP server.
+	// Uses background context so client request cancellation doesn't cancel key fetching
+	initCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	provider, err := oidc.NewProvider(initCtx, j.oidcIssuer)
+	if err != nil {
+		return nil, fmt.Errorf("failed to discover OIDC provider %q: %w", j.oidcIssuer, err)
+	}
+
+	j.oidcVerifier = provider.Verifier(&oidc.Config{ClientID: j.oidcClientID})
+	return j.oidcVerifier, nil
+}
+
+// GenerateTokenResponse generates a new Registry JWT token
 func (j *JWTManager) GenerateTokenResponse(_ context.Context, claims JWTClaims) (*TokenResponse, error) {
 	// Check whether they have global permissions (used by admins)
 	hasGlobalPermissions := false
@@ -125,10 +181,97 @@ func (j *JWTManager) GenerateTokenResponse(_ context.Context, claims JWTClaims) 
 	}, nil
 }
 
-// ValidateToken validates a Registry JWT token and returns the claims
-func (j *JWTManager) ValidateToken(_ context.Context, tokenString string) (*JWTClaims, error) {
-	// Parse token
-	// This also validates expiry
+// ValidateToken validates a Registry JWT token, falling back to OIDC if configured
+func (j *JWTManager) ValidateToken(ctx context.Context, tokenString string) (*JWTClaims, error) {
+	// Parse unverified header to route by algorithm first (performance and algorithm confusion defense)
+	parser := jwt.NewParser()
+	var rawClaims jwt.MapClaims
+	token, _, err := parser.ParseUnverified(tokenString, &rawClaims)
+
+	if err == nil && token.Header["alg"] == "EdDSA" {
+		return j.validateEdDSAToken(tokenString)
+	}
+
+	// Fallback to OIDC validation if EdDSA validation doesn't match or isn't EdDSA alg
+	if !j.oidcEnabled {
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse token: %w", err)
+		}
+		return nil, fmt.Errorf("failed to parse token: invalid signing method")
+	}
+
+	verifier, oidcErr := j.getOIDCVerifier(ctx)
+	if oidcErr != nil {
+		return nil, fmt.Errorf("OIDC verifier initialization failed: %w", oidcErr)
+	}
+
+	idToken, err := verifier.Verify(ctx, tokenString)
+	if err != nil {
+		return nil, fmt.Errorf("failed to verify OIDC token: %w", err)
+	}
+
+	var oidcClaims map[string]any
+	if err := idToken.Claims(&oidcClaims); err != nil {
+		return nil, fmt.Errorf("failed to extract claims: %w", err)
+	}
+
+	// Extract subject identity: upn -> email -> sub
+	subIdentity := ""
+	if upn, ok := oidcClaims["upn"].(string); ok && upn != "" {
+		subIdentity = upn
+	} else if email, ok := oidcClaims["email"].(string); ok && email != "" {
+		// Secure verification checks
+		if emailVerified, hasVerification := oidcClaims["email_verified"].(bool); hasVerification && !emailVerified {
+			return nil, fmt.Errorf("unverified email claim rejected")
+		}
+		subIdentity = email
+	} else {
+		subIdentity = idToken.Subject
+	}
+
+	if subIdentity == "" {
+		return nil, fmt.Errorf("OIDC token claims lack subject identity")
+	}
+
+	// Map configured OIDC permissions (prevents wildcard privilege escalation)
+	var permissions []Permission
+	if j.oidcPublishPerms != "" {
+		for _, pattern := range strings.Split(j.oidcPublishPerms, ",") {
+			pattern = strings.TrimSpace(pattern)
+			if pattern != "" {
+				permissions = append(permissions, Permission{
+					Action:          PermissionActionPublish,
+					ResourcePattern: pattern,
+				})
+			}
+		}
+	}
+	if j.oidcEditPerms != "" {
+		for _, pattern := range strings.Split(j.oidcEditPerms, ",") {
+			pattern = strings.TrimSpace(pattern)
+			if pattern != "" {
+				permissions = append(permissions, Permission{
+					Action:          PermissionActionEdit,
+					ResourcePattern: pattern,
+				})
+			}
+		}
+	}
+
+	return &JWTClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   idToken.Subject,
+			Issuer:    idToken.Issuer,
+			IssuedAt:  jwt.NewNumericDate(idToken.IssuedAt),
+			ExpiresAt: jwt.NewNumericDate(idToken.Expiry),
+		},
+		AuthMethod:        MethodOIDC,
+		AuthMethodSubject: subIdentity,
+		Permissions:       permissions,
+	}, nil
+}
+
+func (j *JWTManager) validateEdDSAToken(tokenString string) (*JWTClaims, error) {
 	token, err := jwt.ParseWithClaims(
 		tokenString,
 		&JWTClaims{},
@@ -136,18 +279,16 @@ func (j *JWTManager) ValidateToken(_ context.Context, tokenString string) (*JWTC
 		jwt.WithValidMethods([]string{"EdDSA"}),
 		jwt.WithExpirationRequired(),
 	)
-	// Validate token
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse token: %w", err)
 	}
 	if !token.Valid {
-		return nil, fmt.Errorf("invalid token")
+		return nil, fmt.Errorf("failed to parse token: invalid token status")
 	}
 
-	// Extract claims
 	claims, ok := token.Claims.(*JWTClaims)
 	if !ok {
-		return nil, fmt.Errorf("invalid token claims")
+		return nil, fmt.Errorf("failed to parse token: invalid token claims mapping")
 	}
 
 	return claims, nil
