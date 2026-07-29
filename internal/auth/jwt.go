@@ -89,7 +89,7 @@ func NewJWTManager(cfg *config.Config) *JWTManager {
 }
 
 // getOIDCVerifier returns a thread-safe, lazily initialized IDTokenVerifier
-func (j *JWTManager) getOIDCVerifier(ctx context.Context) (*oidc.IDTokenVerifier, error) {
+func (j *JWTManager) getOIDCVerifier() (*oidc.IDTokenVerifier, error) {
 	if !j.oidcEnabled {
 		return nil, fmt.Errorf("OIDC is not enabled")
 	}
@@ -200,7 +200,7 @@ func (j *JWTManager) ValidateToken(ctx context.Context, tokenString string) (*JW
 		return nil, fmt.Errorf("failed to parse token: invalid signing method")
 	}
 
-	verifier, oidcErr := j.getOIDCVerifier(ctx)
+	verifier, oidcErr := j.getOIDCVerifier()
 	if oidcErr != nil {
 		return nil, fmt.Errorf("OIDC verifier initialization failed: %w", oidcErr)
 	}
@@ -215,8 +215,12 @@ func (j *JWTManager) ValidateToken(ctx context.Context, tokenString string) (*JW
 		return nil, fmt.Errorf("failed to extract claims: %w", err)
 	}
 
+	return j.mapOIDCClaims(idToken, oidcClaims)
+}
+
+func (j *JWTManager) mapOIDCClaims(idToken *oidc.IDToken, oidcClaims map[string]any) (*JWTClaims, error) {
 	// Extract subject identity: upn -> email -> sub
-	subIdentity := ""
+	var subIdentity string
 	if upn, ok := oidcClaims["upn"].(string); ok && upn != "" {
 		subIdentity = upn
 	} else if email, ok := oidcClaims["email"].(string); ok && email != "" {
