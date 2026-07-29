@@ -50,7 +50,7 @@ jobs:
 
       - name: Build and push with ko
         env:
-          KO_DOCKER_REPO: ghcr.io/${{ steps.build-info.outputs.repo_lowercase }}
+          KO_DOCKER_REPO: ghcr.io/coreason-ai/mcp-registry-v2
           VERSION: develop-${{ steps.build-info.outputs.date }}-${{ steps.build-info.outputs.short_sha }}
           GIT_COMMIT: ${{ github.sha }}
           BUILD_TIME: ${{ steps.build-info.outputs.timestamp }}
