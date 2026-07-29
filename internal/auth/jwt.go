@@ -113,8 +113,9 @@ func (j *JWTManager) getOIDCVerifier(ctx context.Context) (*oidc.IDTokenVerifier
 	}
 
 	// Bounded initialization timeout to prevent hanging the HTTP server.
-	// Uses background context so client request cancellation doesn't cancel key fetching
-	initCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Uses WithoutCancel so client request cancellation doesn't cancel key fetching,
+	// satisfying the contextcheck linter.
+	initCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 
 	provider, err := oidc.NewProvider(initCtx, j.oidcIssuer)
@@ -215,8 +216,12 @@ func (j *JWTManager) ValidateToken(ctx context.Context, tokenString string) (*JW
 		return nil, fmt.Errorf("failed to extract claims: %w", err)
 	}
 
+	return j.mapOIDCClaims(idToken, oidcClaims)
+}
+
+func (j *JWTManager) mapOIDCClaims(idToken *oidc.IDToken, oidcClaims map[string]any) (*JWTClaims, error) {
 	// Extract subject identity: upn -> email -> sub
-	subIdentity := ""
+	var subIdentity string
 	if upn, ok := oidcClaims["upn"].(string); ok && upn != "" {
 		subIdentity = upn
 	} else if email, ok := oidcClaims["email"].(string); ok && email != "" {
