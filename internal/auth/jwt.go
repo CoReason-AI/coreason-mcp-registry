@@ -89,7 +89,7 @@ func NewJWTManager(cfg *config.Config) *JWTManager {
 }
 
 // getOIDCVerifier returns a thread-safe, lazily initialized IDTokenVerifier
-func (j *JWTManager) getOIDCVerifier() (*oidc.IDTokenVerifier, error) {
+func (j *JWTManager) getOIDCVerifier(ctx context.Context) (*oidc.IDTokenVerifier, error) {
 	if !j.oidcEnabled {
 		return nil, fmt.Errorf("OIDC is not enabled")
 	}
@@ -113,8 +113,9 @@ func (j *JWTManager) getOIDCVerifier() (*oidc.IDTokenVerifier, error) {
 	}
 
 	// Bounded initialization timeout to prevent hanging the HTTP server.
-	// Uses background context so client request cancellation doesn't cancel key fetching
-	initCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Uses WithoutCancel so client request cancellation doesn't cancel key fetching,
+	// satisfying the contextcheck linter.
+	initCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 
 	provider, err := oidc.NewProvider(initCtx, j.oidcIssuer)
@@ -200,7 +201,7 @@ func (j *JWTManager) ValidateToken(ctx context.Context, tokenString string) (*JW
 		return nil, fmt.Errorf("failed to parse token: invalid signing method")
 	}
 
-	verifier, oidcErr := j.getOIDCVerifier()
+	verifier, oidcErr := j.getOIDCVerifier(ctx)
 	if oidcErr != nil {
 		return nil, fmt.Errorf("OIDC verifier initialization failed: %w", oidcErr)
 	}
