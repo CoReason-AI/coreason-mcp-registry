@@ -3,7 +3,7 @@ name: Deploy to Staging
 on:
   push:
     branches:
-      - main
+      - develop
     paths-ignore:
       - 'deploy/Pulumi.gcpProd.yaml'
 
@@ -50,7 +50,7 @@ jobs:
       - name: Build and push with ko
         env:
           KO_DOCKER_REPO: ghcr.io/${{ github.repository }}
-          VERSION: main-${{ steps.build-info.outputs.date }}-${{ steps.build-info.outputs.short_sha }}
+          VERSION: develop-${{ steps.build-info.outputs.date }}-${{ steps.build-info.outputs.short_sha }}
           GIT_COMMIT: ${{ github.sha }}
           BUILD_TIME: ${{ steps.build-info.outputs.timestamp }}
         run: |
@@ -58,7 +58,7 @@ jobs:
           ko build ./cmd/registry \
             --bare \
             --platform=linux/amd64,linux/arm64 \
-            --tags=main-${{ steps.build-info.outputs.date }}-${{ steps.build-info.outputs.short_sha }},main
+            --tags=develop-${{ steps.build-info.outputs.date }}-${{ steps.build-info.outputs.short_sha }},develop
 
   deploy-staging:
     name: Deploy to Staging
